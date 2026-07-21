@@ -85,11 +85,40 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
 
+/* Single read from the coord transport (recv() semantics).
+ * With CONFIG_ML_CTRL_TLS the Noise byte stream runs inside TLS records;
+ * timeouts still surface as -1/EAGAIN via the TLS BIO. */
+static int coord_raw_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+#ifdef CONFIG_ML_CTRL_TLS
+    return ml_coord_tls_recv(ml, buf, len);
+#else
+    return ml_recv(ml->coord_sock, buf, len, 0);
+#endif
+}
+
+/* Close the coord connection (TLS session first, then the socket) */
+static void coord_close_conn(microlink_t *ml) {
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_free(ml);
+#endif
+    if (ml->coord_sock >= 0) {
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+    }
+}
+
 static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     /* Set send timeout to prevent indefinite blocking (v1 uses MSG_DONTWAIT) */
     struct timeval snd_tv = { .tv_sec = 5, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml_coord_tls_send(ml, data, len) < 0) {
+        ESP_LOGE(TAG, "coord_send (TLS) failed: len=%d errno=%d", (int)len, errno);
+        return -1;
+    }
+    return 0;
+#else
     size_t sent = 0;
     while (sent < len) {
         int n = ml_send(ml->coord_sock, data + sent, len - sent, 0);
@@ -101,13 +130,14 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
         sent += n;
     }
     return 0;
+#endif
 }
 
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
-        int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
+        int n = coord_raw_recv(ml, buf + recvd, len - recvd);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
@@ -227,7 +257,13 @@ static int do_tcp_connect(microlink_t *ml) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
+#ifdef CONFIG_ML_CTRL_TLS
+    const char *ctrl_port = "443";
+#else
+    const char *ctrl_port = "80";
+#endif
+
+    if (ml_getaddrinfo(CTRL_HOST(ml), ctrl_port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
         return -1;
     }
@@ -257,7 +293,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%s...", CTRL_HOST(ml), ctrl_port);
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -272,6 +308,17 @@ static int do_tcp_connect(microlink_t *ml) {
              (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
 
     ml->coord_sock = sock;
+
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+        return -1;
+    }
+    int64_t t_tls = esp_timer_get_time();
+    ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms", (t_tls - t_tcp) / 1000);
+#endif
+
     return 0;
 }
 
@@ -286,10 +333,24 @@ static int s_server_extra_data_len = 0;
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
-    /* Initialize Noise state with our machine key and Tailscale's server key */
+    /* Initialize Noise state with our machine key and the control plane's
+     * server key. CONFIG_ML_CTRL_NOISE_PUBKEY_HEX overrides the built-in
+     * Tailscale key for Headscale-compatible control planes (value comes
+     * from https://<control-host>/key?v=88 → "publicKey":"mkey:<hex>"). */
+    const uint8_t *server_key = NULL;
+#ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+    static uint8_t custom_server_key[32];
+    if (CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
+        if (hex_to_bytes(CONFIG_ML_CTRL_NOISE_PUBKEY_HEX, custom_server_key, 32) == 32) {
+            server_key = custom_server_key;
+        } else {
+            ESP_LOGE(TAG, "Invalid ML_CTRL_NOISE_PUBKEY_HEX (need 64 hex chars) — using built-in key");
+        }
+    }
+#endif
     ml_noise_init(noise,
                    ml->machine_private_key, ml->machine_public_key,
-                   NULL);  /* NULL = use default Tailscale server key */
+                   server_key);
 
     /* Build Noise message 1 (101 bytes) */
     uint8_t msg1[128];
@@ -334,7 +395,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp = ml_psram_malloc(2048);
     if (!resp) return -1;
 
-    int total = ml_recv(ml->coord_sock, resp, 2047, 0);
+    int total = coord_raw_recv(ml, resp, 2047);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
         free(resp);
@@ -468,7 +529,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
-            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            int n = coord_raw_recv(ml, extra_data, 1024);
             if (n > 0) {
                 extra_len = n;
                 ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
@@ -1987,13 +2048,20 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* Try to read one incremental MapResponse update (non-blocking) */
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
-    /* Use select() to check if data is available before blocking in recv */
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(ml->coord_sock, &readfds);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
-    int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
-    if (sel <= 0) return 0;  /* No data available or error */
+#ifdef CONFIG_ML_CTRL_TLS
+    /* Decrypted bytes may already sit in the TLS layer with nothing left
+     * on the socket — select() alone would miss them. */
+    if (ml_coord_tls_pending(ml) == 0)
+#endif
+    {
+        /* Use select() to check if data is available before blocking in recv */
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(ml->coord_sock, &readfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
+        int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
+        if (sel <= 0) return 0;  /* No data available or error */
+    }
 
     /* Data available — set short recv timeout for partial frame safety */
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
@@ -2166,10 +2234,7 @@ void ml_coord_task(void *arg) {
                 }
                 break;
             case ML_CMD_DISCONNECT:
-                if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
-                }
+                coord_close_conn(ml);
                 state = COORD_IDLE;
                 ml->state = ML_STATE_IDLE;
                 break;
@@ -2233,8 +2298,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2248,8 +2312,7 @@ void ml_coord_task(void *arg) {
         case COORD_H2_PREFACE:
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2260,8 +2323,7 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Registering...");
             if (do_register(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Registration failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2272,8 +2334,7 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Fetching peers...");
             if (do_fetch_peers(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "MapRequest failed, will retry");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2567,10 +2628,7 @@ void ml_coord_task(void *arg) {
                 reconnect_attempts++;
 
                 /* Close old connection */
-                if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
-                }
+                coord_close_conn(ml);
 
                 /* Reset Noise state for fresh handshake */
                 memset(&noise, 0, sizeof(noise));
@@ -2582,10 +2640,7 @@ void ml_coord_task(void *arg) {
     }
 
     /* Cleanup */
-    if (ml->coord_sock >= 0) {
-        ml_close_sock(ml->coord_sock);
-        ml->coord_sock = -1;
-    }
+    coord_close_conn(ml);
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");

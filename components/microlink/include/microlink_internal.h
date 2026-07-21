@@ -79,7 +79,11 @@ extern "C" {
 #define ML_DERP_PORT            443
 
 /* Tailscale control plane */
+#ifdef CONFIG_ML_CTRL_HOST
+#define ML_CTRL_HOST            CONFIG_ML_CTRL_HOST
+#else
 #define ML_CTRL_HOST            "controlplane.tailscale.com"
+#endif
 #define ML_CTRL_PORT            443
 #define ML_CTRL_PROTOCOL_VER    131
 
@@ -331,6 +335,19 @@ typedef struct {
 } ml_derp_conn_t;
 
 /* ============================================================================
+ * Control Plane TLS State (CONFIG_ML_CTRL_TLS)
+ * ========================================================================== */
+
+typedef struct {
+    mbedtls_ssl_context ssl;        /* Owned exclusively by coord task */
+    mbedtls_ssl_config ssl_conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    int sockfd;                     /* Copy of coord_sock for the BIO callbacks */
+    bool active;                    /* TLS session established */
+} ml_coord_tls_t;
+
+/* ============================================================================
  * Main Context
  * ========================================================================== */
 
@@ -379,6 +396,9 @@ struct microlink_s {
 
     /* Coordination socket (owned exclusively by coord task) */
     int coord_sock;
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_t coord_tls;
+#endif
     uint32_t h2_next_stream_id;         /* Next H2 stream ID for endpoint updates (odd, starts at 7) */
 
     /* WireGuard netif (owned exclusively by wg_mgr task) */
@@ -487,6 +507,15 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
                              uint32_t *out_ip, uint16_t *out_port);
 bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
                                   uint8_t *out_ip6, uint16_t *out_port);
+
+/* ml_coord_tls.c (CONFIG_ML_CTRL_TLS) */
+#ifdef CONFIG_ML_CTRL_TLS
+int ml_coord_tls_handshake(microlink_t *ml, const char *hostname);
+int ml_coord_tls_send(microlink_t *ml, const uint8_t *data, size_t len);
+int ml_coord_tls_recv(microlink_t *ml, uint8_t *buf, size_t len);
+size_t ml_coord_tls_pending(microlink_t *ml);
+void ml_coord_tls_free(microlink_t *ml);
+#endif
 
 /* ml_noise.c */
 void ml_noise_init(ml_noise_state_t *state,
