@@ -613,7 +613,7 @@ V2 uses fully dynamic DERP discovery — no manual region configuration needed. 
 
 MicroLink supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
 
-**Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct.
+**Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct. The server's Noise public key can likewise be supplied at runtime via `ctrl_noise_pubkey` (32 bytes) — fetch it from `https://<host>/key?v=88` (`"publicKey":"mkey:<hex>"`) during provisioning, or pin it at build time (below).
 
 **Build-time configuration:** For pre-provisioned firmware, or when the HTTP config server is disabled, the control plane can also be set at build time:
 

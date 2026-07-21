@@ -334,13 +334,16 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
     /* Initialize Noise state with our machine key and the control plane's
-     * server key. CONFIG_ML_CTRL_NOISE_PUBKEY_HEX overrides the built-in
-     * Tailscale key for Headscale-compatible control planes (value comes
-     * from https://<control-host>/key?v=88 → "publicKey":"mkey:<hex>"). */
+     * server key. Priority: config-struct key (runtime, e.g. fetched from
+     * https://<control-host>/key?v=88 at provisioning time) >
+     * CONFIG_ML_CTRL_NOISE_PUBKEY_HEX (build-time) > built-in Tailscale key. */
     const uint8_t *server_key = NULL;
+    if (ml->ctrl_noise_pubkey_set) {
+        server_key = ml->ctrl_noise_pubkey;
+    }
 #ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
     static uint8_t custom_server_key[32];
-    if (CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
+    if (!server_key && CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
         if (hex_to_bytes(CONFIG_ML_CTRL_NOISE_PUBKEY_HEX, custom_server_key, 32) == 32) {
             server_key = custom_server_key;
         } else {

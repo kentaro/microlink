@@ -462,8 +462,15 @@ struct microlink_s {
     char nvs_device_name[48];
 
     /* Control plane host override (empty = use ML_CTRL_HOST default).
-     * Set from NVS at boot for Headscale/Ionscale/custom coordinators. */
+     * Set from config struct or NVS at boot for Headscale/Ionscale/custom
+     * coordinators. */
     char ctrl_host[64];
+
+    /* Control plane Noise public key override (from config struct;
+     * ctrl_noise_pubkey_set false = use CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+     * or the built-in Tailscale key) */
+    uint8_t ctrl_noise_pubkey[32];
+    bool ctrl_noise_pubkey_set;
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */

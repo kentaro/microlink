@@ -45,6 +45,15 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Custom control plane (Headscale / Ionscale). NULL = use the
+     * CONFIG_ML_CTRL_HOST / CONFIG_ML_CTRL_NOISE_PUBKEY_HEX build-time
+     * values, falling back to Tailscale's. The NVS web-UI override, if
+     * present, still wins over both. */
+    const char *ctrl_host;          /* Coordination server hostname */
+    const uint8_t *ctrl_noise_pubkey; /* Server Noise public key (32 bytes),
+                                        e.g. fetched from https://<host>/key?v=88
+                                        at provisioning time */
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
