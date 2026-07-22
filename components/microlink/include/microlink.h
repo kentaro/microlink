@@ -54,6 +54,16 @@ typedef struct {
     const uint8_t *ctrl_noise_pubkey; /* Server Noise public key (32 bytes),
                                         e.g. fetched from https://<host>/key?v=88
                                         at provisioning time */
+
+    /* Some headscale-based controllers never respond to the initial
+     * Stream=false MapRequest (e.g. ZTL: 60s of zero bytes -> Empty
+     * MapResponse -> reconnect loop). The official Tailscale client uses a
+     * single Stream=true streaming poll from the start, and the first stream
+     * message carries the full netmap (Peers + DERPMap).
+     * Setting this to true switches to that scheme (start with Stream=true /
+     * OmitPeers=false and take Peers + DERPMap from the first MapResponse).
+     * false (default) keeps the existing Stream=false one-shot fetch. */
+    bool streaming_map_fetch;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
