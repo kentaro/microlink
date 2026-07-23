@@ -751,6 +751,9 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
  * ========================================================================== */
 
+/* do_register: the control plane rejected our auth (vs. -1 = I/O error) */
+#define ML_REG_AUTH_FAILED (-2)
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -1012,6 +1015,25 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
     parse_start[parse_len] = saved;
     free(resp_buf);
+
+    /* The control plane reports auth problems in-band: a non-empty Error or
+     * MachineAuthorized=false means the auth key was rejected (expired,
+     * revoked, or pending approval). Without this check a rejected
+     * registration looks like success and the client spins in the reconnect
+     * loop with no way for the host app to tell the user. Return
+     * ML_REG_AUTH_FAILED so the coordinator can raise ML_STATE_AUTH_FAILED. */
+    cJSON *reg_err = cJSON_GetObjectItem(resp_json, "Error");
+    if (reg_err && cJSON_IsString(reg_err) && reg_err->valuestring[0]) {
+        ESP_LOGE(TAG, "Registration rejected by control plane: %s", reg_err->valuestring);
+        cJSON_Delete(resp_json);
+        return ML_REG_AUTH_FAILED;
+    }
+    cJSON *authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
+    if (authorized && cJSON_IsFalse(authorized)) {
+        ESP_LOGE(TAG, "Registration not authorized by control plane");
+        cJSON_Delete(resp_json);
+        return ML_REG_AUTH_FAILED;
+    }
 
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
@@ -2565,11 +2587,25 @@ void ml_coord_task(void *arg) {
 
         case COORD_REGISTER:
             ESP_LOGI(TAG, "Registering...");
-            if (do_register(ml, &noise) < 0) {
-                ESP_LOGE(TAG, "Registration failed");
-                coord_close_conn(ml);
-                state = COORD_RECONNECTING;
-                break;
+            {
+                int reg_rc = do_register(ml, &noise);
+                if (reg_rc < 0) {
+                    ESP_LOGE(TAG, "Registration failed");
+                    if (reg_rc == ML_REG_AUTH_FAILED) {
+                        /* Not transient: retrying with the same key will keep
+                         * failing. Notify the host (its "re-login" prompt) and
+                         * jump to maximum backoff — the loop keeps running in
+                         * case the key is re-enabled server-side. */
+                        ml->state = ML_STATE_AUTH_FAILED;
+                        if (ml->state_cb) {
+                            ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                        }
+                        reconnect_attempts = 5;
+                    }
+                    coord_close_conn(ml);
+                    state = COORD_RECONNECTING;
+                    break;
+                }
             }
             state = COORD_FETCH_PEERS;
             break;
@@ -2825,6 +2861,10 @@ void ml_coord_task(void *arg) {
                                 break;
                             } else {
                                 ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
+                                ml->state = ML_STATE_AUTH_FAILED;
+                                if (ml->state_cb) {
+                                    ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                                }
                             }
                         }
                         /* Warn 1 hour before expiry (rough uptime-based check) */
