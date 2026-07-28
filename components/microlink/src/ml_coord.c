@@ -2924,8 +2924,11 @@ void ml_coord_task(void *arg) {
 
                 /* CONNECTED や AUTH_FAILED と同様にホストへ通知する (画面等の
                  * 状態表示が接続中のまま残るのを防ぐ)。バックオフごとに再入する
-                 * ため、遷移した最初の1回だけ発火する */
-                if (ml->state != ML_STATE_RECONNECTING) {
+                 * ため遷移した最初の1回だけ発火し、AUTH_FAILED 中は上書きしない
+                 * (キー失効は「人の操作が必要」な状態で、再試行のたびに
+                 * RECONNECTING へ落とすとホストの再ログイン表示が消えてしまう) */
+                if (ml->state != ML_STATE_RECONNECTING &&
+                    ml->state != ML_STATE_AUTH_FAILED) {
                     ml->state = ML_STATE_RECONNECTING;
                     if (ml->state_cb) {
                         ml->state_cb(ml, ML_STATE_RECONNECTING, ml->state_cb_data);
