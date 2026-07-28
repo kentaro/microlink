@@ -2922,11 +2922,13 @@ void ml_coord_task(void *arg) {
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);
 
-                /* CONNECTED や AUTH_FAILED と同様にホストへ通知する (画面等の
-                 * 状態表示が接続中のまま残るのを防ぐ)。バックオフごとに再入する
-                 * ため遷移した最初の1回だけ発火し、AUTH_FAILED 中は上書きしない
-                 * (キー失効は「人の操作が必要」な状態で、再試行のたびに
-                 * RECONNECTING へ落とすとホストの再ログイン表示が消えてしまう) */
+                /* Notify the host like CONNECTED and AUTH_FAILED do, so a
+                 * status display does not keep showing "connected" through an
+                 * outage. The loop re-enters this state on every backoff
+                 * cycle, so fire only on the transition — and never downgrade
+                 * AUTH_FAILED, which requires human action: overwriting it
+                 * with RECONNECTING on each retry would clear the host's
+                 * re-login prompt. */
                 if (ml->state != ML_STATE_RECONNECTING &&
                     ml->state != ML_STATE_AUTH_FAILED) {
                     ml->state = ML_STATE_RECONNECTING;
