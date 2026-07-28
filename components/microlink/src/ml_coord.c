@@ -2922,7 +2922,15 @@ void ml_coord_task(void *arg) {
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);
 
-                ml->state = ML_STATE_RECONNECTING;
+                /* CONNECTED や AUTH_FAILED と同様にホストへ通知する (画面等の
+                 * 状態表示が接続中のまま残るのを防ぐ)。バックオフごとに再入する
+                 * ため、遷移した最初の1回だけ発火する */
+                if (ml->state != ML_STATE_RECONNECTING) {
+                    ml->state = ML_STATE_RECONNECTING;
+                    if (ml->state_cb) {
+                        ml->state_cb(ml, ML_STATE_RECONNECTING, ml->state_cb_data);
+                    }
+                }
 
                 /* Wait on command queue with backoff timeout (interruptible!) */
                 ml_coord_cmd_t wake_cmd;
